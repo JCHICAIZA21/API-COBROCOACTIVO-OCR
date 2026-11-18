@@ -1,7 +1,7 @@
 # Esqueleto de arquitectura hexagonal del servicio
 
 Type: prototype
-Status: open
+Status: claimed
 Blocked by: 07
 
 ## Question
