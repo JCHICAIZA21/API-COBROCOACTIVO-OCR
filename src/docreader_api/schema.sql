@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS reading_items (
 -- Job summary, result pages and the job_id foreign key all go through this index.
 CREATE UNIQUE INDEX IF NOT EXISTS reading_items_job_position ON reading_items (job_id, position);
 
--- Unfinished items only (stays small): backlog and stuck "processing" items for operations.
+-- Unfinished items only (stays small): re-enqueue of orphan pending items, stuck "processing".
 CREATE INDEX IF NOT EXISTS reading_items_open ON reading_items (status, updated_at)
     WHERE status IN ('pending', 'processing');
+
+-- Retention: oldest jobs first.
+CREATE INDEX IF NOT EXISTS reading_jobs_created_at ON reading_jobs (created_at);

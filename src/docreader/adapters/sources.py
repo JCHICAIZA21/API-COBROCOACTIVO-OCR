@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import stat
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path, PureWindowsPath
+from typing import TYPE_CHECKING
 
 import httpx
 
 from docreader.domain import DocReaderError, DocumentNotFound, DocumentRejected, SourceKind
+
+if TYPE_CHECKING:
+    import asyncpg
 
 
 def _check_size(size: int, max_bytes: int) -> None:
@@ -63,13 +67,16 @@ class FileShareSource:
         except (FileNotFoundError, NotADirectoryError):
             raise DocumentNotFound("El documento no existe en el directorio compartido.") from None
         except OSError:
-            raise DocReaderError("No se pudo leer el documento del directorio compartido.") from None
+            raise DocReaderError("No se pudo leer el documento compartido.") from None
         _check_size(len(data), self._max_bytes)
         return data
 
     def _resolve(self, ref: str) -> Path:
         """Map `ref` to a real path inside the base dir, or raise `DocumentRejected`."""
-        # Lexical checks first: resolving a UNC path (\\host\share) would already reach the
+        # "\" is a separator on every platform (clients may be Windows systems), so "..\"
+        # stays a traversal on Linux too. Normalized before any other check.
+        ref = ref.replace("\\", "/")
+        # Lexical checks next: resolving a UNC path (//host/share) would already reach the
         # network on Windows. PureWindowsPath also sees "/" roots, so this covers POSIX too.
         if not ref or "\x00" in ref or PureWindowsPath(ref).anchor:
             raise DocumentRejected("La ruta del documento no es válida.")
@@ -102,10 +109,26 @@ class HttpSource:
         self._schemes = frozenset({"https", "http"} if allow_http else {"https"})
         self._max_bytes = max_bytes
         self._timeout_s = timeout_s
-        self._client = client
+        self._injected = client  # owned by the caller: never closed here
+        self._own: httpx.AsyncClient | None = None
 
     async def fetch(self, ref: str) -> bytes:
         url = self._validate(ref)
+        # `from None`: httpx errors may carry the URL, which may contain personal data.
+        try:
+            async with asyncio.timeout(self._timeout_s):  # total deadline, not per read
+                return await self._download(url)
+        except TimeoutError:
+            raise DocReaderError("Se agotó el tiempo de descarga del documento.") from None
+        except httpx.HTTPError:
+            raise DocReaderError("No se pudo descargar el documento del origen.") from None
+
+    async def aclose(self) -> None:
+        if self._own is not None:
+            await self._own.aclose()
+            self._own = None
+
+    async def _download(self, url: httpx.URL) -> bytes:
         # Per-request `follow_redirects=False`: an injected client must not override it.
         # `identity`: no compressed body, so the size cap counts what is actually received.
         async with self._http().stream(
@@ -121,10 +144,6 @@ class HttpSource:
                 _check_size(len(body), self._max_bytes)
             return bytes(body)
 
-    async def aclose(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-
     def _validate(self, ref: str) -> httpx.URL:
         """Parse once with httpx and send that same object: no parser differential."""
         try:
@@ -133,12 +152,85 @@ class HttpSource:
             raise DocumentRejected("La URL del documento no es válida.") from None
         if url.scheme not in self._schemes or url.userinfo:
             raise DocumentRejected("La URL del documento no está permitida.")
-        host = url.host.rstrip(".")
-        if not (host in self._exact or (not _is_ip_literal(host) and host.endswith(self._suffixes))):
+        if not self._host_allowed(url.host.rstrip(".")):
             raise DocumentRejected("El dominio del documento no está en la lista permitida.")
         return url
 
+    def _host_allowed(self, host: str) -> bool:
+        """Exact entry, or a subdomain of a ".suffix" entry. IP literals only match exactly."""
+        if host in self._exact:
+            return True
+        return not _is_ip_literal(host) and host.endswith(self._suffixes)
+
     def _http(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self._timeout_s)
-        return self._client
+        if self._injected is not None:
+            return self._injected
+        if self._own is None:  # lazy and shared; no await in between, so no race
+            self._own = httpx.AsyncClient(timeout=self._timeout_s, follow_redirects=False)
+        return self._own
+
+
+PoolFactory = Callable[..., Awaitable["asyncpg.Pool"]]
+
+
+class PostgresBlobSource:
+    """Reads a document BLOB with a configured query; `ref` is bound to `$1`, never formatted."""
+
+    kind: SourceKind = "blob"
+
+    def __init__(
+        self, dsn: str, query: str, *, max_bytes: int, pool_factory: PoolFactory | None = None
+    ) -> None:
+        self._dsn = dsn
+        self._query = query
+        self._max_bytes = max_bytes
+        self._pool_factory = pool_factory
+        self._pool: asyncpg.Pool | None = None
+        self._pool_lock = asyncio.Lock()
+
+    async def fetch(self, ref: str) -> bytes:
+        import asyncpg  # optional dependency (extra "api"): only needed for this source
+
+        if not ref:
+            raise DocumentRejected("La referencia del documento no es válida.")
+        pool = await self._get_pool()
+        # `from None`: asyncpg and PostgreSQL echo parameter values in their messages.
+        try:
+            value = await pool.fetchval(self._query, ref)
+        except (asyncpg.exceptions.DataError, ValueError):  # ref unfit for the column type
+            raise DocumentRejected("La referencia del documento no es válida.") from None
+        except _db_errors():
+            raise DocReaderError("No se pudo consultar el documento.") from None
+        if value is None:
+            raise DocumentNotFound("El documento no existe en la base de datos.")
+        if not isinstance(value, bytes | memoryview):
+            raise DocReaderError("La consulta de documentos no devolvió contenido binario.")
+        data = bytes(value)
+        _check_size(len(data), self._max_bytes)
+        return data
+
+    async def aclose(self) -> None:
+        async with self._pool_lock:
+            if self._pool is not None:
+                await self._pool.close()
+                self._pool = None
+
+    async def _get_pool(self) -> asyncpg.Pool:
+        import asyncpg
+
+        async with self._pool_lock:  # concurrent first calls share one pool
+            if self._pool is None:
+                factory = self._pool_factory or asyncpg.create_pool
+                try:
+                    self._pool = await factory(self._dsn, min_size=1, max_size=10)
+                except _db_errors() as exc:
+                    # Chained on purpose: connection errors carry no client data.
+                    raise DocReaderError("No se pudo conectar a la base de datos.") from exc
+            return self._pool
+
+
+def _db_errors() -> tuple[type[Exception], ...]:
+    """Infrastructure failures of asyncpg (imported lazily: optional dependency)."""
+    import asyncpg
+
+    return (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError)

@@ -86,9 +86,7 @@ class InMemoryJobStore:
         self.jobs: dict[UUID, _Job] = {}
         self.items: dict[UUID, JobItem] = {}
 
-    async def create_job(
-        self, client: str, requests: list[ReadRequest]
-    ) -> tuple[UUID, list[UUID]]:
+    async def create_job(self, client: str, requests: list[ReadRequest]) -> tuple[UUID, list[UUID]]:
         job_id, item_ids = uuid4(), [uuid4() for _ in requests]
         self.jobs[job_id] = _Job(job_id, client, datetime.now(UTC), item_ids)
         for position, (item_id, request) in enumerate(zip(item_ids, requests, strict=True)):
@@ -126,9 +124,7 @@ class InMemoryJobStore:
             ),
         )
 
-    async def list_items(
-        self, job_id: UUID, client: str, offset: int, limit: int
-    ) -> list[JobItem]:
+    async def list_items(self, job_id: UUID, client: str, offset: int, limit: int) -> list[JobItem]:
         job = self._owned(job_id, client)
         if job is None:
             return []

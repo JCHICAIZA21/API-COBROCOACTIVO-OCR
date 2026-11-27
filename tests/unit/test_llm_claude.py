@@ -1,6 +1,8 @@
 """ClaudeExtractor against the real SDK, with the HTTP layer replaced by a mock transport."""
 
+import base64
 import json
+import os
 from typing import Any
 
 import anthropic
@@ -9,7 +11,13 @@ import pytest
 
 from docreader.adapters.llm_claude import ClaudeExtractor
 from docreader.adapters.llm_common import output_schema
-from docreader.domain import DocumentTemplate, ExtractionContext, FieldSpec, PageText
+from docreader.domain import (
+    DocumentTemplate,
+    ExtractionContext,
+    ExtractorError,
+    FieldSpec,
+    PageText,
+)
 
 MODEL = "claude-haiku-5-5"
 FIELDS = (
@@ -85,3 +93,80 @@ async def test_native_pages_are_sent_as_text_with_a_strict_output_schema():
     assert body["system"]
     assert extractor.name == "claude"
     assert extractor.external is True
+
+
+async def test_scanned_pages_send_the_pdf_before_the_text():
+    api = FakeApi(message('{"nro_comparendo": null, "placa": "ABC123"}'))
+    extractor = ClaudeExtractor(MODEL, client=api.client())
+
+    found = await extractor.extract(context(NATIVE, SCANNED))
+
+    assert found["placa"].value == "ABC123"
+    [user] = api.sent["messages"]
+    document, text = user["content"]
+    assert document == {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": base64.b64encode(PDF).decode(),
+        },
+    }
+    assert text["type"] == "text"
+
+
+ANSWER = '{"nro_comparendo": "12345", "placa": null}'
+
+
+@pytest.mark.parametrize(
+    ("body", "status"),
+    [
+        # Stop reasons are checked before the content, even when it looks complete.
+        (message(ANSWER, "refusal", stop_details={"type": "refusal", "category": None}), 200),
+        (message(ANSWER, stop_reason="max_tokens"), 200),
+        (message(ANSWER, stop_reason="model_context_window_exceeded"), 200),
+        ({"type": "error", "error": {"type": "api_error", "message": "boom"}}, 500),
+    ],
+    ids=["refusal", "max_tokens", "context_window", "api_error"],
+)
+async def test_unusable_answers_raise_extractor_error_without_document_data(body, status):
+    extractor = ClaudeExtractor(MODEL, client=FakeApi(body, status).client())
+
+    with pytest.raises(ExtractorError) as error:
+        await extractor.extract(context(NATIVE))
+
+    assert str(error.value).startswith("claude:")
+    assert "12345" not in str(error.value)
+
+
+async def test_effort_and_max_tokens_are_configurable_and_thinking_is_left_to_the_model():
+    api = FakeApi(message(ANSWER))
+    await ClaudeExtractor(MODEL, client=api.client()).extract(context(NATIVE))
+    default = api.sent
+
+    await ClaudeExtractor(MODEL, client=api.client(), effort="low", max_tokens=2048).extract(
+        context(NATIVE)
+    )
+
+    assert "effort" not in default["output_config"]
+    assert "thinking" not in default
+    assert api.sent["output_config"]["effort"] == "low"
+    assert api.sent["max_tokens"] == 2048
+
+
+async def test_refusals_fall_back_to_another_model_server_side():
+    api = FakeApi(message(ANSWER))
+
+    await ClaudeExtractor(MODEL, client=api.client()).extract(context(NATIVE))
+
+    assert api.sent["fallbacks"] == "default"
+    assert "server-side-fallback-2026-07-01" in api.requests[-1].headers["anthropic-beta"]
+
+
+@pytest.mark.live
+@pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="sin ANTHROPIC_API_KEY")
+async def test_live_extraction_from_native_text():
+    found = await ClaudeExtractor(MODEL, effort="low").extract(context(NATIVE))
+
+    assert found["nro_comparendo"].value == "12345"
+    assert "placa" not in found

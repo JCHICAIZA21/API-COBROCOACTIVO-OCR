@@ -42,7 +42,7 @@ def test_load_template_reads_comparendo() -> None:
 def test_load_template_rejects_regex_that_does_not_compile(tmp_path: Path) -> None:
     path = write(tmp_path, "roto.yaml", pattern=r"placa (?P<value>\\w+")
 
-    with pytest.raises(DocReaderError, match="roto.yaml"):
+    with pytest.raises(DocReaderError, match=r"roto\.yaml"):
         load_template(path)
 
 
@@ -59,17 +59,15 @@ def test_load_template_rejects_malformed_file(tmp_path: Path, content: str) -> N
     path = tmp_path / "malo.yaml"
     path.write_text(content, encoding="utf-8")
 
-    with pytest.raises(DocReaderError, match="malo.yaml"):
+    with pytest.raises(DocReaderError, match=r"malo\.yaml"):
         load_template(path)
 
 
 def test_load_template_rejects_duplicate_field_names(tmp_path: Path) -> None:
     path = tmp_path / "doble.yaml"
-    path.write_text(
-        "id: t1\nversion: '1'\nfields:\n  - name: x\n  - name: x\n", encoding="utf-8"
-    )
+    path.write_text("id: t1\nversion: '1'\nfields:\n  - name: x\n  - name: x\n", encoding="utf-8")
 
-    with pytest.raises(DocReaderError, match="doble.yaml"):
+    with pytest.raises(DocReaderError, match=r"doble\.yaml"):
         load_template(path)
 
 
@@ -110,7 +108,7 @@ def test_repository_fails_fast_on_invalid_file(tmp_path: Path) -> None:
     write(tmp_path, "a.yaml", id="a")
     write(tmp_path, "roto.yml", id="b", pattern="(")
 
-    with pytest.raises(DocReaderError, match="roto.yml"):
+    with pytest.raises(DocReaderError, match=r"roto\.yml"):
         YamlTemplateRepository(tmp_path)
 
 

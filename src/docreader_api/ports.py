@@ -65,7 +65,10 @@ class JobStore(Protocol):
     ) -> list[JobItem]: ...
 
     async def claim_item(self, item_id: UUID) -> JobItem | None:
-        """Mark a pending (or stale processing) item as processing; None if already finished."""
+        """Mark a pending (or stale processing) item as processing; None if already finished.
+
+        An item that already used every attempt is marked failed and returned with that status.
+        """
         ...
 
     async def complete_item(self, item_id: UUID, result: ReadResult) -> None: ...

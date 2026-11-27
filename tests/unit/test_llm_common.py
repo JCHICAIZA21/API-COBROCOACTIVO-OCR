@@ -64,7 +64,9 @@ def test_found_values_become_candidates_and_absent_ones_are_omitted():
 
 
 def test_empty_strings_are_treated_as_not_found():
-    found = parse_candidates('{"nro_comparendo": "  ", "placa": ""}', FIELDS, engine="e", confidence=1)
+    found = parse_candidates(
+        '{"nro_comparendo": "  ", "placa": ""}', FIELDS, engine="e", confidence=1
+    )
 
     assert found == {}
 

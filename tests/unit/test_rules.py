@@ -12,10 +12,13 @@ from docreader.ports import FieldExtractor
 from docreader.rules import RegexExtractor
 from docreader.templates import load_template
 
+COMPARENDO_YAML = Path(__file__).resolve().parents[2] / "templates" / "comparendo.yaml"
 PLACA = FieldSpec(name="placa", kind="plate", patterns=(r"placa\s*:?\s*(?P<value>[A-Z0-9-]+)",))
 
 
-def context(*texts: str, fields: tuple[FieldSpec, ...] = (PLACA,), ocr: bool = False):
+def context(
+    *texts: str, fields: tuple[FieldSpec, ...] = (PLACA,), ocr: bool = False
+) -> ExtractionContext:
     template = DocumentTemplate(id="t", version="1", fields=fields)
     pages = tuple(
         PageText(
@@ -106,7 +109,7 @@ async def test_snippet_is_40_chars_around_the_value_on_one_line() -> None:
 
 
 async def test_comparendo_template_reads_a_synthetic_comparendo() -> None:
-    template = load_template(Path(__file__).resolve().parents[2] / "templates" / "comparendo.yaml")
+    template = load_template(COMPARENDO_YAML)
     text = (
         "SECRETARÍA DISTRITAL DE MOVILIDAD\n"
         "ORDEN DE COMPARENDO No. 11001000000012345678\n"

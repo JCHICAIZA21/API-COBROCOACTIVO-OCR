@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from PIL.Image import Image
 
 from .domain import (
     Candidate,
@@ -36,8 +39,8 @@ class OcrEngine(Protocol):
 
     name: str
 
-    def recognize(self, png: bytes) -> tuple[str, float]:
-        """Return (text, confidence in [0, 1])."""
+    def recognize(self, image: Image) -> tuple[str, float]:
+        """Return (text in reading order, one line per text line; confidence in [0, 1])."""
         ...
 
 

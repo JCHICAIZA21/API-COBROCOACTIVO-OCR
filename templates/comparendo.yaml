@@ -10,13 +10,13 @@ fields:
     key: true
     description: Número del comparendo (orden de comparendo), solo dígitos.
     patterns:
-      - '(?:orden\s+de\s+)?comparendo\s*(?:n[o°º.]*|n[uú]mero)?\s*[:#]?\s*(?P<value>\d[\d\s.-]{4,30}\d)'
+      - '(?:orden\s+de\s+)?comparendo\s*(?:n[o°º.]*|n[uú]mero)?\s*[:#]?\s*(?P<value>\d[\d .-]{4,30}\d)'
   - name: identificacion
     kind: id_number
     key: true
     description: Número de identificación (cédula o NIT) del infractor, solo dígitos.
     patterns:
-      - '(?:c\.?\s*c\.?|c[eé]dula(?:\s+de\s+ciudadan[ií]a)?|identificaci[oó]n|documento|nit)\s*(?:n[o°º.]*|n[uú]mero)?\s*[:#]?\s*(?P<value>\d[\d.,\s-]{3,18}\d)'
+      - '(?:c\.?\s*c\.?|c[eé]dula(?:\s+de\s+ciudadan[ií]a)?|identificaci[oó]n|documento|nit)\s*(?:n[o°º.]*|n[uú]mero)?\s*[:#]?\s*(?P<value>\d[\d., -]{3,18}\d)'
   - name: fecha
     kind: date
     key: true

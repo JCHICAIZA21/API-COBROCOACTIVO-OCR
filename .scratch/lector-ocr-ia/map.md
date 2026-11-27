@@ -25,6 +25,9 @@ Microservicio en Python (eslabón de lectura OCR/IA) **especificado y con un MVP
 - [Criterios de aceptación del MVP](issues/09-criterios-aceptacion-mvp.md): ≥ 99,5 % de exactitud en campos clave; p95 ≤ 1 s nativo y ≤ 5 s escaneado; lo dudoso queda en `needs_review`.
 - [Contrato de la API y origen de los PDFs](issues/10-contrato-api-y-origen-pdf.md): IA externa por solicitud con default prohibido, `X-API-Key`, lectura síncrona + lotes asíncronos, Ollama opcional.
 - [Claude API vs OpenAI API para extracción estructurada](issues/06-claude-vs-openai-extraccion.md): SDK simétricos; candidatos Haiku 5.5 / gpt-6-luna; lotes y archivos no son ZDR; envío al exterior sujeto a Ley 1581.
+- [Motores locales de texto y OCR para PDFs mixtos](issues/05-motores-locales-texto-y-ocr.md): pypdfium2 para texto; RapidOCR (PP-OCRv5 latin) por defecto y Tesseract como alternativa; modelos incluidos en la imagen.
+- [Operación: reintentos, retención y modo de llamada LLM](issues/15-operacion-reintentos-retencion-llm.md): 3 intentos; retención configurable con 365 días por defecto; LLM solo síncrono (Opus 5.5 / gpt-6.2-sol); diseño para CPU.
+- [Esqueleto de arquitectura hexagonal del servicio](issues/11-esqueleto-arquitectura.md): núcleo reutilizable + servicio, puertos y adaptadores, cascada de lo barato a lo caro; construido y medido.
 
 ## Not yet specified
 

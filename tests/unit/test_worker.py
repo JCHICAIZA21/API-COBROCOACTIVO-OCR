@@ -1,9 +1,13 @@
-"""Worker behavior through its public `run`, with in-memory store, queue and reader."""
+"""Worker and Maintenance behavior through their public `run`, with in-memory doubles."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import time
 from collections.abc import AsyncIterator, Callable
+from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -18,7 +22,7 @@ from docreader.domain import (
     TemplateNotFound,
 )
 from docreader_api.ports import ItemStatus, JobItem, JobSummary
-from docreader_api.worker import Worker
+from docreader_api.worker import Maintenance, Worker
 
 # --- Test doubles -----------------------------------------------------------------------------
 
@@ -30,23 +34,17 @@ class MemoryStore:
         self.items: dict[UUID, JobItem] = {}
 
     def add(self, request: ReadRequest, status: ItemStatus = ItemStatus.PENDING) -> UUID:
-        item = JobItem(
-            id=uuid4(), job_id=uuid4(), position=0, request=request, status=status
-        )
+        item = JobItem(id=uuid4(), job_id=uuid4(), position=0, request=request, status=status)
         self.items[item.id] = item
         return item.id
 
-    async def create_job(
-        self, client: str, requests: list[ReadRequest]
-    ) -> tuple[UUID, list[UUID]]:
+    async def create_job(self, client: str, requests: list[ReadRequest]) -> tuple[UUID, list[UUID]]:
         raise NotImplementedError
 
     async def get_job(self, job_id: UUID, client: str) -> JobSummary | None:
         raise NotImplementedError
 
-    async def list_items(
-        self, job_id: UUID, client: str, offset: int, limit: int
-    ) -> list[JobItem]:
+    async def list_items(self, job_id: UUID, client: str, offset: int, limit: int) -> list[JobItem]:
         raise NotImplementedError
 
     async def claim_item(self, item_id: UUID) -> JobItem | None:
@@ -72,7 +70,7 @@ class MemoryQueue:
     def __init__(self) -> None:
         self._messages: asyncio.Queue[tuple[str, UUID]] = asyncio.Queue()
         self.acked: list[str] = []
-        self.delivered = 0
+        self.changed = asyncio.Condition()
 
     async def enqueue(self, item_ids: list[UUID]) -> None:
         for item_id in item_ids:
@@ -80,12 +78,12 @@ class MemoryQueue:
 
     async def consume(self, consumer: str) -> AsyncIterator[tuple[str, UUID]]:
         while True:
-            message = await self._messages.get()
-            self.delivered += 1
-            yield message
+            yield await self._messages.get()
 
     async def ack(self, message_id: str) -> None:
-        self.acked.append(message_id)
+        async with self.changed:
+            self.acked.append(message_id)
+            self.changed.notify_all()
 
 
 class FakeReader:
@@ -93,10 +91,13 @@ class FakeReader:
 
     def __init__(self, behavior: Callable[[ReadRequest], object] | None = None) -> None:
         self.calls: list[tuple[ReadRequest, bytes | None]] = []
+        self.changed = asyncio.Condition()
         self._behavior = behavior
 
     async def read(self, request: ReadRequest, content: bytes | None = None) -> ReadResult:
-        self.calls.append((request, content))
+        async with self.changed:
+            self.calls.append((request, content))
+            self.changed.notify_all()
         if self._behavior is not None:
             outcome = self._behavior(request)
             if asyncio.iscoroutine(outcome):
@@ -163,14 +164,12 @@ class Harness:
         return ids
 
     async def wait_acked(self, count: int) -> None:
-        async with asyncio.timeout(2):
-            while len(self.queue.acked) < count:
-                await asyncio.sleep(0.005)
+        async with asyncio.timeout(2), self.queue.changed:
+            await self.queue.changed.wait_for(lambda: len(self.queue.acked) >= count)
 
     async def wait_reads(self, count: int) -> None:
-        async with asyncio.timeout(2):
-            while len(self.reader.calls) < count:
-                await asyncio.sleep(0.005)
+        async with asyncio.timeout(2), self.reader.changed:
+            await self.reader.changed.wait_for(lambda: len(self.reader.calls) >= count)
 
     async def shutdown(self) -> None:
         self.stop.set()
@@ -367,6 +366,31 @@ async def test_stop_finishes_in_flight_items_and_takes_no_new_ones(tmp_path: Pat
     assert len(h.reader.calls) == 1
 
 
+class ExhaustedStore(MemoryStore):
+    """Every claim finds the item out of attempts, as PostgresJobStore reports it."""
+
+    async def claim_item(self, item_id: UUID) -> JobItem | None:
+        self._finish(item_id, status=ItemStatus.FAILED, error="se agotaron los reintentos")
+        return self.items[item_id]
+
+
+async def test_an_item_out_of_attempts_is_not_read_and_its_upload_is_deleted(
+    tmp_path: Path,
+) -> None:
+    h = Harness(tmp_path, store=ExhaustedStore())
+    h.start()
+    name = f"{uuid4()}.pdf"
+    (h.upload_dir / name).write_bytes(b"%PDF-1.7 crashes the worker")
+    [item_id] = await h.submit(make_request(kind="upload", value=name))
+
+    await h.wait_acked(1)
+    await h.shutdown()
+
+    assert h.reader.calls == []
+    assert h.store.items[item_id].error == "se agotaron los reintentos"
+    assert not (h.upload_dir / name).exists()
+
+
 class BrokenStore(MemoryStore):
     async def complete_item(self, item_id: UUID, result: ReadResult) -> None:
         raise ConnectionError("database unavailable")
@@ -387,3 +411,131 @@ async def test_leaves_the_message_for_redelivery_when_the_store_fails(
     assert h.queue.acked == []
     assert (h.upload_dir / name).exists()  # kept for the retry
     assert str(item_id) in caplog.text
+
+
+# --- Maintenance ------------------------------------------------------------------------------
+
+
+class MemoryMaintenanceStore:
+    """MaintenanceStore double: orphan ids to hand out, a lock that may be taken elsewhere."""
+
+    def __init__(self, orphans: list[UUID] | None = None, locked_elsewhere: bool = False) -> None:
+        self.orphans = orphans or []
+        self.locked_elsewhere = locked_elsewhere
+        self.purged_before: list[timedelta] = []
+        self.rounds = 0
+        self.changed = asyncio.Condition()
+
+    @contextlib.asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[bool]:
+        yield not self.locked_elsewhere
+
+    async def orphaned_pending(self, limit: int) -> list[UUID]:
+        async with self.changed:
+            self.rounds += 1
+            self.changed.notify_all()
+        handed, self.orphans = self.orphans[:limit], self.orphans[limit:]
+        return handed
+
+    async def purge_jobs(self, older_than: timedelta) -> int:
+        self.purged_before.append(older_than)
+        return 0
+
+
+def make_maintenance(
+    tmp_path: Path,
+    store: MemoryMaintenanceStore,
+    queue: MemoryQueue,
+    *,
+    retention: timedelta | None = timedelta(days=365),
+    interval_s: float = 300,
+) -> Maintenance:
+    return Maintenance(
+        store=store,
+        queue=queue,
+        upload_dir=tmp_path,
+        retention=retention,
+        interval_s=interval_s,
+        requeue_batch=2,
+    )
+
+
+def write_upload(directory: Path, name: str, age_days: float) -> Path:
+    path = directory / name
+    path.write_bytes(b"%PDF-1.7")
+    stamp = time.time() - age_days * 86_400
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+async def test_a_round_enqueues_long_pending_items_again_in_bounded_batches(
+    tmp_path: Path,
+) -> None:
+    orphans = [uuid4() for _ in range(3)]
+    store, queue = MemoryMaintenanceStore(orphans), MemoryQueue()
+    maintenance = make_maintenance(tmp_path, store, queue)
+
+    assert await maintenance.run_once()
+
+    consumed = queue.consume("w")
+    delivered = [await anext(consumed) for _ in range(2)]
+    assert [item_id for _, item_id in delivered] == orphans[:2]  # the rest, next round
+
+
+async def test_a_round_deletes_jobs_and_uploads_older_than_the_retention(tmp_path: Path) -> None:
+    store = MemoryMaintenanceStore()
+    old = write_upload(tmp_path, f"{uuid4()}.pdf", age_days=400)
+    recent = write_upload(tmp_path, f"{uuid4()}.pdf", age_days=10)
+    not_ours = write_upload(tmp_path, "notas.pdf", age_days=400)
+
+    await make_maintenance(tmp_path, store, MemoryQueue()).run_once()
+
+    assert store.purged_before == [timedelta(days=365)]
+    assert not old.exists()
+    assert recent.exists()
+    assert not_ours.exists()
+
+
+async def test_without_retention_nothing_is_deleted(tmp_path: Path) -> None:
+    store = MemoryMaintenanceStore()
+    old = write_upload(tmp_path, f"{uuid4()}.pdf", age_days=4000)
+
+    await make_maintenance(tmp_path, store, MemoryQueue(), retention=None).run_once()
+
+    assert store.purged_before == []
+    assert old.exists()
+
+
+async def test_a_round_is_skipped_while_another_worker_runs_it(tmp_path: Path) -> None:
+    store = MemoryMaintenanceStore([uuid4()], locked_elsewhere=True)
+    old = write_upload(tmp_path, f"{uuid4()}.pdf", age_days=400)
+
+    assert not await make_maintenance(tmp_path, store, MemoryQueue()).run_once()
+
+    assert (store.rounds, store.purged_before) == (0, [])
+    assert old.exists()
+
+
+class FlakyMaintenanceStore(MemoryMaintenanceStore):
+    async def orphaned_pending(self, limit: int) -> list[UUID]:
+        handed = await super().orphaned_pending(limit)
+        if self.rounds == 1:
+            raise ConnectionError("database unavailable")
+        return handed
+
+
+async def test_runs_every_interval_until_stopped_and_survives_a_failed_round(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = FlakyMaintenanceStore()
+    maintenance = make_maintenance(tmp_path, store, MemoryQueue(), interval_s=0.01)
+    stop = asyncio.Event()
+    running = asyncio.create_task(maintenance.run(stop))
+
+    async with asyncio.timeout(2), store.changed:
+        await store.changed.wait_for(lambda: store.rounds >= 3)
+    stop.set()
+    async with asyncio.timeout(1):
+        await running
+
+    assert "ConnectionError" in caplog.text

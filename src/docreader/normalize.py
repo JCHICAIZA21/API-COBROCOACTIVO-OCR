@@ -18,12 +18,21 @@ _NAMED_DATE = re.compile(
     re.IGNORECASE | re.ASCII,
 )
 _MONTH_NAMES = (
-    "enero febrero marzo abril mayo junio julio agosto septiembre octubre noviembre diciembre"
-).split()
+    "enero",
+    "febrero",
+    "marzo",
+    "abril",
+    "mayo",
+    "junio",
+    "julio",
+    "agosto",
+    "septiembre",
+    "octubre",
+    "noviembre",
+    "diciembre",
+)
 _MONTHS = {
-    alias: number
-    for number, name in enumerate(_MONTH_NAMES, start=1)
-    for alias in (name, name[:3])
+    alias: number for number, name in enumerate(_MONTH_NAMES, start=1) for alias in (name, name[:3])
 } | {"sept": 9, "set": 9, "setiembre": 9}
 
 _MONEY = re.compile(r"\d+(?:[.,]\d+)*", re.ASCII)

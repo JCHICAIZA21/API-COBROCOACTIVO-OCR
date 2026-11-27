@@ -22,21 +22,20 @@ PROBLEM_JSON = "application/problem+json"
 logger = logging.getLogger(__name__)
 
 
-class ApiError(Exception):
-    """An error reported to the caller as a problem with the given status."""
+class ApiError(StarletteHTTPException):
+    """An error reported to the caller as a problem.
+
+    An HTTPException, so FastAPI lets it through even when raised while reading the body.
+    """
 
     def __init__(
-        self,
-        status: int,
-        title: str,
-        detail: str | None = None,
-        headers: Mapping[str, str] | None = None,
+        self, status: int, title: str, detail: str, headers: Mapping[str, str] | None = None
     ) -> None:
-        super().__init__(title)
-        self.status = status
+        super().__init__(status, detail, dict(headers) if headers else None)
         self.title = title
-        self.detail = detail
-        self.headers = headers
+
+    def response(self) -> JSONResponse:
+        return problem_response(self.status_code, self.title, self.detail, headers=self.headers)
 
 
 # First match wins: subclasses before DocReaderError.
@@ -75,7 +74,7 @@ def problem_response(
 
 async def _api_error(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, ApiError)
-    return problem_response(exc.status, exc.title, exc.detail, headers=exc.headers)
+    return exc.response()
 
 
 async def _domain_error(_: Request, exc: Exception) -> JSONResponse:
@@ -86,7 +85,9 @@ async def _domain_error(_: Request, exc: Exception) -> JSONResponse:
 async def _validation_error(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
     # Only location and message: the rejected input may hold personal data.
-    errors = [ProblemError(loc=list(e.get("loc", ())), msg=str(e.get("msg", ""))) for e in exc.errors()]
+    errors = [
+        ProblemError(loc=list(e.get("loc", ())), msg=str(e.get("msg", ""))) for e in exc.errors()
+    ]
     return problem_response(
         422, "Solicitud inválida", "La solicitud tiene datos inválidos.", errors=errors
     )

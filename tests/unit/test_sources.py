@@ -1,13 +1,16 @@
+import asyncio
 import sys
 import traceback
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import asyncpg
 import httpx
 import pytest
 import respx
+from asyncpg.exceptions._base import DataError as ClientDataError
 
-from docreader.adapters.sources import FileShareSource, HttpSource
+from docreader.adapters.sources import FileShareSource, HttpSource, PostgresBlobSource
 from docreader.domain import DocReaderError, DocumentNotFound, DocumentRejected
 from docreader.ports import DocumentSource
 
@@ -49,7 +52,10 @@ async def test_fileshare_missing_document_is_not_found_without_leaking_the_ref(s
     assert_no_leak(exc_info.value, "1234567890")
 
 
-WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="Windows path semantics")
+async def test_fileshare_treats_backslash_as_a_separator_on_every_platform(share: Path) -> None:
+    source = FileShareSource(share, max_bytes=1024)  # clients may be Windows systems
+
+    assert await source.fetch("sub\\doc.pdf") == PDF
 
 
 @pytest.mark.parametrize(
@@ -57,7 +63,9 @@ WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="Windows path 
     [
         "../secret.pdf",
         "sub/../../secret.pdf",
-        pytest.param("sub\\..\\..\\secret.pdf", marks=WINDOWS_ONLY),
+        "..\\secret.pdf",
+        "sub\\..\\..\\secret.pdf",
+        "sub/..\\../secret.pdf",
     ],
 )
 async def test_fileshare_rejects_traversal_outside_the_base_dir(share: Path, ref: str) -> None:
@@ -82,7 +90,7 @@ async def test_fileshare_rejects_traversal_outside_the_base_dir(share: Path, ref
         "sub/doc\x00.pdf",
     ],
 )
-async def test_fileshare_rejects_absolute_drive_unc_empty_or_nul_refs(share: Path, ref: str) -> None:
+async def test_fileshare_rejects_anchored_empty_or_nul_refs(share: Path, ref: str) -> None:
     source = FileShareSource(share, max_bytes=1024)
 
     with pytest.raises(DocumentRejected):
@@ -284,3 +292,230 @@ async def test_http_accepts_exactly_max_bytes_and_rejects_a_larger_body(
     assert await source.fetch(DOC_URL) == PDF
     with pytest.raises(DocumentRejected):
         await source.fetch("https://docs.example.com/big.pdf")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ConnectTimeout("timed out"),
+        httpx.ReadTimeout("timed out"),
+        httpx.ConnectError("connection refused for docs.example.com/pdf/1234567890.pdf"),
+        httpx.RemoteProtocolError("peer closed connection"),
+    ],
+)
+async def test_http_transport_failures_are_generic_reader_errors(
+    respx_mock: respx.MockRouter, failure: Exception
+) -> None:
+    respx_mock.get(DOC_URL).mock(side_effect=failure)
+    source = HttpSource(["docs.example.com"], max_bytes=1024)
+
+    with pytest.raises(DocReaderError) as exc_info:
+        await source.fetch(DOC_URL)
+
+    assert type(exc_info.value) is DocReaderError
+    assert_no_leak(exc_info.value, "1234567890")
+
+
+async def test_http_enforces_a_total_deadline_against_slow_drip_servers(
+    respx_mock: respx.MockRouter,
+) -> None:
+    async def slow() -> AsyncIterator[bytes]:
+        yield b"%PDF"
+        await asyncio.sleep(30)
+        yield b"never"
+
+    respx_mock.get(DOC_URL).mock(return_value=httpx.Response(200, content=slow()))
+    source = HttpSource(["docs.example.com"], max_bytes=1024, timeout_s=0.2)
+
+    with pytest.raises(DocReaderError) as exc_info:
+        await asyncio.wait_for(source.fetch(DOC_URL), timeout=5)
+
+    assert type(exc_info.value) is DocReaderError
+
+
+async def test_http_aclose_closes_its_own_client_but_not_an_injected_one(
+    respx_mock: respx.MockRouter,
+) -> None:
+    respx_mock.get(DOC_URL).respond(200, content=PDF)
+    injected = httpx.AsyncClient()
+    owned_source = HttpSource(["docs.example.com"], max_bytes=1024)
+    injected_source = HttpSource(["docs.example.com"], max_bytes=1024, client=injected)
+    await owned_source.fetch(DOC_URL)
+    await injected_source.fetch(DOC_URL)
+
+    await owned_source.aclose()
+    await injected_source.aclose()
+
+    assert not injected.is_closed
+    assert await owned_source.fetch(DOC_URL) == PDF  # a new client is created on demand
+    await owned_source.aclose()
+    await injected.aclose()
+
+
+# --- PostgresBlobSource ------------------------------------------------------------------------
+
+DSN = "postgresql://reader:secret@db:5432/docs"
+QUERY = "SELECT content FROM documents WHERE id = $1"
+
+
+class FakePool:
+    """Stands in for asyncpg.Pool: records queries, returns a canned value or raises."""
+
+    def __init__(self, result: object = None, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self.closed = False
+
+    async def fetchval(self, query: str, *args: object) -> object:
+        self.calls.append((query, args))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakePoolFactory:
+    def __init__(self, pool: FakePool) -> None:
+        self.pool = pool
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    async def __call__(self, *args: object, **kwargs: object) -> FakePool:
+        self.calls.append((args, kwargs))
+        await asyncio.sleep(0)  # let concurrent callers interleave
+        return self.pool
+
+
+def blob_source(
+    pool: FakePool, max_bytes: int = 1024
+) -> tuple[PostgresBlobSource, FakePoolFactory]:
+    factory = FakePoolFactory(pool)
+    return PostgresBlobSource(DSN, QUERY, max_bytes=max_bytes, pool_factory=factory), factory
+
+
+async def test_blob_runs_the_configured_query_with_the_ref_as_a_parameter() -> None:
+    pool = FakePool(result=PDF)
+    source, factory = blob_source(pool)
+    ref = "1'; DROP TABLE documents; --"
+
+    assert isinstance(source, DocumentSource)
+    assert source.kind == "blob"
+    assert await source.fetch(ref) == PDF
+    assert pool.calls == [(QUERY, (ref,))]
+    assert factory.calls == [((DSN,), {"min_size": 1, "max_size": 10})]
+
+
+async def test_blob_accepts_memoryview_results() -> None:
+    source, _ = blob_source(FakePool(result=memoryview(PDF)))
+
+    data = await source.fetch("doc-1")
+
+    assert data == PDF
+    assert type(data) is bytes
+
+
+async def test_blob_missing_row_is_not_found_without_leaking_the_ref() -> None:
+    source, _ = blob_source(FakePool(result=None))
+    ref = "1234567890"
+
+    with pytest.raises(DocumentNotFound) as exc_info:
+        await source.fetch(ref)
+
+    assert_no_leak(exc_info.value, ref)
+
+
+async def test_blob_accepts_exactly_max_bytes_and_rejects_larger() -> None:
+    exact, _ = blob_source(FakePool(result=PDF), max_bytes=len(PDF))
+    larger, _ = blob_source(FakePool(result=PDF + b"x"), max_bytes=len(PDF))
+
+    assert await exact.fetch("doc-1") == PDF
+    with pytest.raises(DocumentRejected):
+        await larger.fetch("doc-1")
+
+
+async def test_blob_unexpected_column_type_is_a_reader_error() -> None:
+    source, _ = blob_source(FakePool(result="not bytes"))
+
+    with pytest.raises(DocReaderError) as exc_info:
+        await source.fetch("doc-1")
+
+    assert type(exc_info.value) is DocReaderError
+
+
+async def test_blob_rejects_an_empty_ref_without_querying() -> None:
+    pool = FakePool(result=PDF)
+    source, _ = blob_source(pool)
+
+    with pytest.raises(DocumentRejected):
+        await source.fetch("")
+
+    assert not pool.calls
+
+
+@pytest.mark.parametrize(
+    "error",
+    [  # both messages echo the parameter value, as asyncpg/PostgreSQL do
+        asyncpg.exceptions.InvalidTextRepresentationError('invalid input for uuid: "1234567890"'),
+        ClientDataError("invalid input for query argument $1: '1234567890' (expected int)"),
+    ],
+)
+async def test_blob_ref_of_the_wrong_type_is_rejected_without_leaking_it(error: Exception) -> None:
+    source, _ = blob_source(FakePool(error=error))
+    ref = "1234567890"
+
+    with pytest.raises(DocumentRejected) as exc_info:
+        await source.fetch(ref)
+
+    assert_no_leak(exc_info.value, ref)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        asyncpg.exceptions.UndefinedTableError('relation "documents" does not exist'),
+        asyncpg.exceptions.ConnectionDoesNotExistError("connection was closed (ref 1234567890)"),
+        ConnectionResetError("reset while reading 1234567890"),
+        TimeoutError(),
+    ],
+)
+async def test_blob_database_failures_are_generic_reader_errors(error: Exception) -> None:
+    source, _ = blob_source(FakePool(error=error))
+    ref = "1234567890"
+
+    with pytest.raises(DocReaderError) as exc_info:
+        await source.fetch(ref)
+
+    assert type(exc_info.value) is DocReaderError
+    assert_no_leak(exc_info.value, ref)
+
+
+async def test_blob_pool_creation_failure_is_a_reader_error_and_is_retried() -> None:
+    pool = FakePool(result=PDF)
+    attempts = 0
+
+    async def flaky_factory(*args: object, **kwargs: object) -> FakePool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionRefusedError("database down")
+        return pool
+
+    source = PostgresBlobSource(DSN, QUERY, max_bytes=1024, pool_factory=flaky_factory)
+
+    with pytest.raises(DocReaderError):
+        await source.fetch("doc-1")
+    assert await source.fetch("doc-1") == PDF
+
+
+async def test_blob_creates_one_shared_pool_under_concurrency_and_aclose_closes_it() -> None:
+    pool = FakePool(result=PDF)
+    source, factory = blob_source(pool)
+
+    results = await asyncio.gather(*(source.fetch(f"doc-{i}") for i in range(5)))
+    await source.aclose()
+
+    assert results == [PDF] * 5
+    assert len(factory.calls) == 1
+    assert pool.closed

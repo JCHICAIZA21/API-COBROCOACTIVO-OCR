@@ -12,8 +12,10 @@ from fastapi.security import APIKeyHeader
 from .deps import Deps
 from .errors import ApiError
 
+API_KEY_HEADER = "X-API-Key"
+
 _api_key_header = APIKeyHeader(
-    name="X-API-Key", auto_error=False, description="Llave de API asignada al cliente."
+    name=API_KEY_HEADER, auto_error=False, description="Llave de API asignada al cliente."
 )
 
 
@@ -29,17 +31,22 @@ def authenticate(api_key: str | None, keys: Mapping[str, str]) -> str | None:
     return client
 
 
+def unauthorized() -> ApiError:
+    return ApiError(
+        401,
+        "No autorizado",
+        f"Falta el header {API_KEY_HEADER} o la llave no es válida.",
+        headers={"WWW-Authenticate": "ApiKey"},
+    )
+
+
 async def require_client(
     deps: Deps, api_key: Annotated[str | None, Security(_api_key_header)]
 ) -> str:
+    """Identify the caller. Second line of defense: `RequestGuard` already refused bad keys."""
     client = authenticate(api_key, deps.settings.api_keys)
     if client is None:
-        raise ApiError(
-            401,
-            "No autorizado",
-            "Falta el header X-API-Key o la llave no es válida.",
-            headers={"WWW-Authenticate": "ApiKey"},
-        )
+        raise unauthorized()
     return client
 
 

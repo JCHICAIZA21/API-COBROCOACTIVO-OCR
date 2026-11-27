@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from starlette.types import Lifespan
 
 from docreader.ports import TemplateRepository
 from docreader.settings import ServiceSettings
 
 from .deps import ApiDeps, Reader
 from .errors import install_error_handling
+from .guard import RequestGuard
 from .ports import JobStore, WorkQueue
-from .routes import build_v1_router, health_router
+from .routes import V1_PREFIX, build_v1_router, health_router, upload_body_caps
 
 __all__ = ["Reader", "create_app"]
 
@@ -41,15 +43,24 @@ def create_app(
     templates: TemplateRepository,
     jobs: JobStore,
     queue: WorkQueue,
+    lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
+    """Build the API. `lifespan` opens and closes the collaborators' resources, if any."""
     app = FastAPI(
         title="API de lectura de documentos",
         description=_DESCRIPTION,
         version="1.0.0",
         openapi_tags=_TAGS,
+        lifespan=lifespan,
     )
     app.state.deps = ApiDeps(settings, reader, templates, jobs, queue)
-    install_error_handling(app)
+    app.add_middleware(
+        RequestGuard,
+        prefix=V1_PREFIX,
+        api_keys=settings.api_keys,
+        body_caps=upload_body_caps(settings),
+    )
+    install_error_handling(app)  # added last: its catch-all middleware wraps the guard
     app.include_router(health_router)
     app.include_router(build_v1_router(settings))
     return app

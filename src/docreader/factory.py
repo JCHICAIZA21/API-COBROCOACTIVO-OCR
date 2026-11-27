@@ -8,19 +8,21 @@ from functools import partial
 
 from .cache import MemoryCache
 from .domain import DocReaderError
-from .ports import DocumentSource, FieldExtractor, OcrEngine, PageReader
+from .ports import DocumentSource, FieldExtractor, OcrEngine, PageReader, TemplateRepository
 from .reader import DocumentReader
 from .rules import RegexExtractor
 from .settings import ReaderSettings
 from .templates import YamlTemplateRepository
 
 
-def build_reader(settings: ReaderSettings | None = None) -> DocumentReader:
+def build_reader(
+    settings: ReaderSettings | None = None, *, templates: TemplateRepository | None = None
+) -> DocumentReader:
     """Build a ready-to-use reader from settings (environment variables by default)."""
     s = settings or ReaderSettings()
     max_bytes = s.max_pdf_mb * 1024 * 1024
     return DocumentReader(
-        templates=YamlTemplateRepository(s.templates_dir),
+        templates=templates or YamlTemplateRepository(s.templates_dir),
         pages=build_page_reader(s),
         extractors=build_extractors(s),
         sources=build_sources(s, max_bytes),
@@ -48,11 +50,16 @@ def ocr_factory(s: ReaderSettings) -> Callable[[], OcrEngine] | None:
         case "tesseract":
             from .adapters.ocr_tesseract import TesseractOcr
 
-            return partial(TesseractOcr, lang=s.ocr_lang)
+            return partial(TesseractOcr, lang=s.ocr_lang, models_dir=s.ocr_models_dir)
         case "rapidocr":
             from .adapters.ocr_rapidocr import RapidOcr
 
-            return partial(RapidOcr)
+            return partial(
+                RapidOcr,
+                models_dir=s.ocr_models_dir,
+                threads=s.ocr_threads,
+                det_max_side=s.ocr_det_max_side,
+            )
         case "none":
             return None
     raise DocReaderError(f"motor OCR desconocido: {s.ocr_engine}")
@@ -84,14 +91,18 @@ def build_extractors(s: ReaderSettings) -> list[FieldExtractor]:
                 from .adapters.llm_ollama import OllamaExtractor
 
                 extractors.append(
-                    OllamaExtractor(s.ollama_url, s.ollama_model, timeout_s=s.llm_timeout_s)
+                    OllamaExtractor(s.ollama_url, s.ollama_model, timeout_s=s.ollama_timeout_s)
                 )
             case "claude" if s.external_ai_enabled:
                 from .adapters.llm_claude import ClaudeExtractor
 
                 extractors.append(
                     ClaudeExtractor(
-                        s.claude_model, confidence=s.llm_confidence, timeout_s=s.llm_timeout_s
+                        s.claude_model,
+                        confidence=s.llm_confidence,
+                        max_tokens=s.llm_max_tokens,
+                        timeout_s=s.llm_timeout_s,
+                        effort=s.claude_effort,
                     )
                 )
             case "openai" if s.external_ai_enabled:
@@ -99,7 +110,11 @@ def build_extractors(s: ReaderSettings) -> list[FieldExtractor]:
 
                 extractors.append(
                     OpenAIExtractor(
-                        s.openai_model, confidence=s.llm_confidence, timeout_s=s.llm_timeout_s
+                        s.openai_model,
+                        confidence=s.llm_confidence,
+                        max_output_tokens=s.llm_max_tokens,
+                        timeout_s=s.llm_timeout_s,
+                        reasoning_effort=s.openai_reasoning_effort,
                     )
                 )
     return extractors

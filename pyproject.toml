@@ -26,6 +26,12 @@ api = [
     "redis>=8.1.0",
     "uvicorn[standard]>=0.54.0",
 ]
+ocr = [
+    "onnxruntime>=1.32.0",
+    "pillow>=13.0.0",
+    "rapidocr>=3.10.0",
+    "tesserocr>=2.13.0",
+]
 
 [build-system]
 requires = ["hatchling"]
